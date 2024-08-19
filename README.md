@@ -17,6 +17,6 @@ Progress: Complete.
 
 Point_of_Contact: Katherine Markham.
 
-Native_Environment: Run using Google Earth Engine.
+Native_Environment: Run using Google Earth Engine API.
 
 Completeness_Report: Users must provide own conflict data.
