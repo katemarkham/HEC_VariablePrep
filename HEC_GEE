@@ -1,0 +1,569 @@
+// Purpose: Extracts values for each specified point of interest. 
+
+// Description: This script 1) calculates distance from certain land cover types, as well as 
+// distance from buildings, roads, and rivers, and building density. Rivers, roads, and 
+// buildings are from Open Street Map.
+// 2) This script uses Landsat 8, elevation from JAXA, CHIRPS' precipitation
+// and calculates NDVI, SAVI, & NDMI from Landsat 8 imagery. 
+// 3) It then extracts those values recorded at each point over the specified dates. 
+// Those values are exported as a table to a folder in Google Drive.
+
+// Last updated: June 17, 2024.
+
+// To run this script requires: 1) table of points projected into ESPG: 4326, 2) assets of agricultural 
+// land and 2) forest by year, 3) assets of buildings, roads, and rivers from OSM or other source. 
+// 4) Dates of conflict specified.
+// All other data is extracted from EE datasets. 
+
+
+//--------------------------------------------------------------------------//
+//--------------------User-Specified Parameters & Inputs--------------------//
+//--------------------------------------------------------------------------//
+// Conflict points
+var table= ee.FeatureCollection("users/katherinemarkham/100mRandomPtsConflict4326");
+
+// Boundary of study area
+var table2= ee.FeatureCollection("users/katherinemarkham/Chpt2AOI_Clip");
+
+
+// Land cover data from annual land cover classification (created elsewhere)
+var nlcd2015 = ee.Image('users/katherinemarkham/Classified_L8_2015-01-01_2015-03-31');
+
+var nlcd2016 = ee.Image('users/katherinemarkham/Classified_L8_2016-01-01_2016-03-31');
+
+var nlcd2017 = ee.Image('users/katherinemarkham/Classified_L8_2017-01-01_2017-03-31');
+
+var nlcd2018 = ee.Image('users/katherinemarkham/Classified_L8_2018-01-01_2018-03-31');
+
+var nlcd2020 = ee.Image('users/katherinemarkham/Classified_L8_2020-01-01_2020-03-31');
+
+var nlcd2021 = ee.Image('users/katherinemarkham/Classified_L8_2021-01-01_2021-03-31');
+
+
+//Open Street Map and protected area data
+
+var Roads = ee.FeatureCollection('users/katherinemarkham/RoadsOSM');
+
+var Rivers = ee.FeatureCollection('users/katherinemarkham/RiversOSM');
+
+var Fences = ee.FeatureCollection('users/katherinemarkham/FencesOSM');
+
+var Buildings = ee.FeatureCollection('users/katherinemarkham/BuildingsOSM');
+
+var PA = ee.FeatureCollection('users/katherinemarkham/ProtectedAreas');
+
+//Dictionary of years (only):
+//Year as Key (text) with Value of year (numeric)
+var yearList = {
+'2015': 2015,'2016': 2016,'2017': 2017,'2018': 2018,'2020': 2020,'2021': 2021
+};
+// Crop raiding dates:
+// dictionary of with year as key and values corresponding to the date, as year-month-day, 
+// during which crop raiding was reported in that year.
+var timeline ={'2015 2015-01-01 2015-03-31':2015, 
+'2016 2016-01-01 2016-04-28':2016,
+'2017 2017-03-01 2017-05-31':2017,
+'2018 2018-02-01 2018-05-31':2018,
+'2020 2020-03-01 2020-03-31':2020,
+'2021 2021-01-01 2021-11-30':2021
+};
+
+//Specify maximum cloud coverage for Landsat scene (optional)
+var cloud_coverage= 20; //percentage
+
+//Specify soil adjustment factor (if calculating and using SAVI)
+var L = 0.75; //(value between 0-1.0)
+
+
+//----------------------------Export location--------------------------//
+//Folder in Google Drive for saving
+var GEE_Folder = 'GEE_Exports';
+
+
+//--------------------------------------------------------------------------//
+//--------------------------------Set-Up-----------------------//
+//--------------------------------------------------------------------------//
+// Print conflict points
+print('Conflict Table Count:', table.size());
+
+print(table);
+
+//Map the points
+Map.addLayer(table,{},"Points");
+
+//Map the study area
+Map.addLayer(table2,{},"AOI");
+
+//Consolidate all inputs from OSM by their 'fid' property
+var Roads2 = Roads.reduceToImage({
+    properties: ['fid'],
+    reducer: ee.Reducer.sum()
+});
+
+var Rivers2 = Rivers.reduceToImage({
+    properties: ['fid'],
+    reducer: ee.Reducer.sum()
+});
+
+var Fences2 = Fences.reduceToImage({
+    properties: ['fid'],
+    reducer: ee.Reducer.sum()
+});
+
+var Buildings2 = Buildings.reduceToImage({
+    properties: ['OSM_ID_1'],
+    reducer: ee.Reducer.sum()
+});
+
+var PA2 = PA.reduceToImage({
+    properties: ['fid'],
+    reducer: ee.Reducer.sum()
+});
+
+// Create arbitrary constant images from land cover.
+var constant1 = ee.Image(nlcd2015).set("system:id", "nlcd2015");
+var constant2 = ee.Image(nlcd2016).set("system:id", "nlcd2016");
+var constant3 = ee.Image(nlcd2017).set("system:id", "nlcd2017");
+var constant4 = ee.Image(nlcd2018).set("system:id", "nlcd2018");
+var constant5 = ee.Image(nlcd2020).set("system:id", "nlcd2020");
+var constant6 = ee.Image(nlcd2021).set("system:id", "nlcd2021"); 
+
+
+// Create a collection by giving a list to the constructor.
+var collectionFromConstructor = ee.ImageCollection([constant1, constant2,constant3,constant4,constant5,constant6]);
+print('collectionFromConstructor: ', collectionFromConstructor);
+
+//------------------------------------------------------------------//
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~SECTION 1~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+//------------------------------------------------------------------//
+
+
+//---------------Palettes--------------
+var palettes = require('users/gena/packages:palettes');
+var NdviPal = palettes.cmocean.Speed[7];
+var SAVIVis = {min: -1, max: 1, palette: ['red', 'yellow', 'green']};
+var igbpPalette = [
+  '00000000', // Not Suitable
+  'cdb33b',
+  '#68ab5f',
+  '#1c5f2c',
+  '#dcd939',
+  '#ff0000',
+  '#0000ff',
+  '#9f1feb',
+  '#40dfd0'
+];
+
+var imageVisParam = {"opacity":1,
+                   "bands":["distance"],
+                   "min":0,
+                  "max":15,
+                   "palette":["22ff20","1a35ff","ffa925","ff0a36","2fe1ff","fd4bff"]};
+//----------------------------------------  
+//------Calculate building density--------
+//----------------------------------------  
+//Map.addLayer(Buildings2,{},"Buildings2",false);
+// Function creating a new feature from the centroid of the geometry.
+var getCentroid = function(feature) {
+  // Keep this list of properties.
+  var keepProperties = ['building', 'OSM_ID_1'];
+  // Get the centroid of the feature's geometry.
+  var centroid = feature.geometry().centroid();
+  // Return a new Feature, copying properties from the old Feature.
+  return ee.Feature(centroid).copyProperties(feature, keepProperties);
+};
+
+
+// grab an image to use as a reference
+var first = ee.ImageCollection('COPERNICUS/S2_SR')
+                .filterBounds(table2)
+                .filterDate('2019-01-01', '2019-12-31')
+                .sort('CLOUDY_PIXEL_PERCENTAGE')
+                .first();
+             
+
+var BuildingsD =
+  Buildings.select(['OSM_ID_1'])
+  .map(function (feature) {
+    return feature.set('Density', feature.geometry().area());
+  });
+  
+//print(BuildingsD, "BuildingsD");
+
+// get projection of reference image
+var proj = first.select('B4').projection();
+
+//print(table2,"table2");
+
+var polygrid = table2.geometry().coveringGrid(proj,30); //30m pix size
+Map.addLayer(polygrid,{color:'00000000'},"Fishnet",false);
+
+// Map the centroid getting function over the features.
+var BldPts = Buildings.map(getCentroid);
+
+
+//create an image of the buildings
+var BldDensity = BuildingsD.reduceToImage({
+    properties: ['Density'],
+    reducer: ee.Reducer.sum()
+});
+
+Map.addLayer(BldDensity,null,"BldDensity",false);
+
+// Applying first reducer for calculating building density
+var results = BldDensity.reduceRegions({
+  collection: polygrid, 
+  reducer: ee.Reducer.first(), 
+  scale: 10000, // Native resolution-search area
+});
+
+//comvert calculation to image
+var BldDensity_Final = results.reduceToImage({
+    properties: ['first'],
+    reducer: ee.Reducer.sum()
+});
+//divide by 100,000,000 for density within 10000m2 pix
+var BldDensityF = BldDensity_Final.divide(100000000);
+
+Map.addLayer(BldDensityF,null,"BldDensityF",false);
+
+
+//-----------------------FUNCTIONS---------------------//
+//Cloud mask
+function maskL8sr(image) {
+// Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+// Get the pixel QA band.
+  var qa = image.select('QA_PIXEL');
+// Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+
+//Calculate NDVI, SAVI, NDMI
+ var SAVI = function(image) {
+    return image.expression(
+      '((NIR - RED) / (NIR + RED + L)) * (1 + L)', {
+        'NIR': image.select('SR_B5').multiply(0.0001),
+        'RED': image.select('SR_B4').multiply(0.0001),
+        'L': L
+      }).rename('SAVI').copyProperties(image, image.propertyNames());
+  };
+  
+
+var NDVI = function(image) {
+  return image.expression(
+    '(NIR - RED) / (NIR + RED)', {
+      'NIR': image.select('SR_B5'),
+      'RED': image.select('SR_B4'),
+    }).rename('NDVI').copyProperties(image, image.propertyNames());
+};
+
+
+var NDMI = function(image) {
+  return image.expression(
+    '((NIR - SWIR) / (NIR + SWIR))', {
+      'NIR': image.select('SR_B5'),
+      'SWIR': image.select('SR_B6')
+    }).rename('NDMI').copyProperties(image, image.propertyNames());
+};
+
+//functions that extract the values for each set of absence points
+var ExtractData = function(img) {
+    return img.sampleRegions({collection: NewTable, scale: 30, geometries: true});
+  };
+  
+
+// For loop that loops through multiple years, separates the data 
+// based on years, cycles through the data based on the months and years defined in 
+// dictionary, extract NDVI, SAVI, distance from ag and forest, and then exports all of that
+// into tables.
+
+for (var year in timeline) {
+ // print(year.split(' '));
+  var  df = year.split(' ');
+  print(df[1]);
+  print(df[2]);
+  print(df[0]);
+
+  
+  var StartDate = df[1];
+  var EndDate = df[2];
+
+  var NewTable = table.filter(ee.Filter.eq('YEAR', df[0].toString()));
+  print('Table Count ' + df[0] +' :', NewTable.size());
+
+
+  var dataset = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+                    .filter(ee.Filter.date(StartDate, EndDate));
+  var precipitation = dataset.select('precipitation');
+  var precipitationVis = {
+    min: 1.0,
+    max: 17.0,
+    palette: ['001137', '0aab1e', 'e7eb05', 'ff4a2d', 'e90000'],
+  };
+  
+  Map.addLayer(precipitation, precipitationVis, df[0]+' Precipitation', false);
+  
+  print('nlcd'+df[0].toString());
+  
+ //Landcover data
+  var lulc = collectionFromConstructor.filter(ee.Filter.eq("system:id", 'nlcd'+df[0].toString()));
+  //print(lulc)
+  var agriculture = lulc.first().eq(2);
+  var closedForest = lulc.first().eq(9);
+
+  var dist_agr = agriculture
+    .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})//250 is the size of the buffer and within each buffer it checks for points
+    .clip(table2)
+    .rename('Dist_Ag');
+    
+  var dist_CFT = closedForest
+  .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})
+  .clip(table2)
+  .rename('Dist_CF');
+
+
+  var BUILDINGDE = BldDensityF
+  .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})
+  .clip(table2)
+  .rename('BUILDINGDE');
+  
+  
+  var DISTROADS = Roads2
+    .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})
+    .clip(table2)
+    .rename('DISTROADS');
+  
+  
+  var DISTWATER = Rivers2
+    .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})
+    .clip(table2)
+    .rename('DISTWATER');
+    
+    
+  var DISTFENCES = Fences2
+    .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})
+    .clip(table2)
+    .rename('DISTFENCES');
+    
+  var DISTBUILDING = Buildings2
+    .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})
+    .clip(table2)
+    .rename('DISTBUILDING');
+    
+  var DISTPA = PA2
+    .distance({kernel:ee.Kernel.euclidean(250), skipMasked:false})
+    .clip(table2)
+    .rename('DISTPA');
+
+  //-------
+  //Map.addLayer(dist_agr, imageVisParam, ' Agriculture distance');
+
+  //Map.addLayer(dist_CFT, imageVisParam, 'Closed forest distance');
+  
+//----------------------------Imagery--------------------------//
+  //Elevaton data
+  var SRTMdataset = ee.Image('USGS/SRTMGL1_003');
+  var elevation = SRTMdataset.select('elevation');
+  var SRTMslope = ee.Terrain.slope(elevation);
+  Map.addLayer(SRTMslope, {min: 0, max: 60}, 'slope',false);
+  
+  
+  //--SAR data from ALOS-PALSAR--
+  var alos = ee.Image("JAXA/ALOS/PALSAR/YEARLY/SAR_EPOCH/2015");
+  
+  
+  var hvhh = alos.expression( '(HV/HH)', { 'HH': alos.select('HH'), 'HV': alos.select('HV') }).rename('HVHH');
+  var alos = alos.addBands(hvhh);
+  var DN = alos.select('HH'); 
+  var HVdB = DN.pow(2).log10().multiply(10).subtract(83); 
+  HVdB = HVdB.rename(['HV']); 
+  var alosHVVis = { min: -20, max: -5, };
+  Map.addLayer(HVdB, alosHVVis, 'HV',false);
+  
+  //--Landsat----
+  //Map.centerObject(table);
+  Map.addLayer(table,{color: 'f231f2'},'pts',false); // #f231f2 pink FFFFFFFF white 
+  var L8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+        .filterDate(StartDate, EndDate) 
+        .filterBounds(table)
+        .sort('CLOUD_COVER', true)
+        .filterMetadata('CLOUD_COVER', 'less_than', cloud_coverage)
+        .map(maskL8sr);
+  
+  //print(L8);
+  
+  var NDVIcol = L8.map(maskL8sr)
+    .map(NDVI);
+
+  print(NDVIcol,"NDVI IMAGE");
+  Map.addLayer(NDVIcol, {min: -1,max: 1,palette: NdviPal}, df[0]+' NDVI',false);
+  
+  var SAVIcol = L8.map(maskL8sr)
+    .map(SAVI);
+    
+  Map.addLayer(SAVIcol, {min: -1,max: 1,palette: ['red', 'yellow', 'green']}, df[0]+' SAVI',false);
+  
+  
+  var NDMIcol = L8.map(maskL8sr)
+    .map(NDMI);
+
+
+//------------------------------------------------------------------//
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~SECTION 2~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+//------------------------------------------------------------------//
+
+
+//------------------Extract data for points----------------//
+
+  var newft = ee.FeatureCollection(NDVIcol.map(ExtractData)).flatten();
+  
+  var newft2 = ee.FeatureCollection(SAVIcol.map(ExtractData)).flatten();
+
+
+  var newft4 = ee.FeatureCollection(precipitation.map(ExtractData)).flatten();
+
+  var newft5 = SRTMslope.sampleRegions({collection: NewTable, scale: 30, geometries: true});
+
+  var newft6 = elevation.sampleRegions({collection: NewTable, scale: 30, geometries: true});
+
+  var newft7 = ee.FeatureCollection(NDMIcol.map(ExtractData)).flatten();
+
+  var newft8 = HVdB.sampleRegions({collection: NewTable, scale: 25, geometries: true});
+  
+  var newft9 = dist_CFT.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+  
+  var newft10 = dist_agr.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+
+  var newft11 = DISTROADS.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+  
+  var newft12 = DISTWATER.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+  
+  var newft13 = DISTFENCES.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+  
+  var newft14 = DISTBUILDING.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+
+  var newft15 = DISTPA.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+  
+  var newft16 = BUILDINGDE.sampleRegions({collection: NewTable, scale: 1000, geometries: true});
+
+  
+  
+//------------------------------------------------------------------//
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~SECTION 3~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+//------------------------------------------------------------------//
+
+
+//----------------------------Exporting--------------------------//
+
+//Export point data to tables
+  Export.table.toDrive({
+    collection: newft,
+    description: 'NDVI_L_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });    
+  
+  Export.table.toDrive({
+    collection: newft2,
+    description: 'SAVI_L_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });    
+      
+      
+    Export.table.toDrive({
+    collection: newft4,
+    description: 'CHIRPS_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft5,
+    description: 'SRTM_slope_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+  
+  Export.table.toDrive({
+    collection: newft6,
+    description: 'Elevation_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+  
+  Export.table.toDrive({
+    collection: newft7,
+    description: 'NDMI_L_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft8,
+    description: 'SAR_HV_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+  collection: newft10,
+  description: 'Agriculture_Dist_'+ df[0],
+  fileFormat: 'CSV',
+  folder: GEE_Folder,
+    });
+      
+  Export.table.toDrive({
+    collection: newft9,
+    description: 'ClosedForest_Dist_'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft11,
+    description: 'DISTROADS'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft12,
+    description: 'DISTWATER'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft13,
+    description: 'DISTFENCES'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft14,
+    description: 'DISTBUILDING'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft15,
+    description: 'DISTPA'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+      
+  Export.table.toDrive({
+    collection: newft16,
+    description: 'BUILDINGDE'+ df[0],
+    fileFormat: 'CSV',
+    folder: GEE_Folder,
+      });
+}
